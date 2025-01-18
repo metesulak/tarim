@@ -1,0 +1,174 @@
+import rasterio
+import numpy as np
+import pandas as pd
+import glob
+import geopandas as gpd
+from shapely import wkt
+from rasterio.features import geometry_mask
+from math import atan, pi
+from joblib import Parallel, delayed
+import time
+
+def calculate_slope_aspect(dem, transform):
+    try:
+        dx, dy = np.gradient(dem, 30, 30) 
+        slope_radians = np.arctan(np.sqrt(dx**2 + dy**2)) 
+        slope_degrees = slope_radians * (180 / pi) 
+        aspect = (np.arctan2(dy, -dx) * (180 / pi)) % 360
+        return slope_degrees, aspect
+    except Exception as e:
+        print(f"Eğim ve bakı hesaplaması hatası: {e}")
+        return None, None
+
+def calculate_stats(masked_slope, masked_aspect, masked_dem):
+    try:
+        avg_slope_deg = np.nanmean(masked_slope)
+        slope_percent = np.tan(np.radians(masked_slope)) * 100  
+        max_slope_percent = np.nanmax(slope_percent)
+        min_height = np.nanmin(masked_dem)
+        max_height = np.nanmax(masked_dem)
+        dominant_aspect = np.nanmean(masked_aspect)
+        return avg_slope_deg, slope_percent, max_slope_percent, min_height, max_height, dominant_aspect
+    except Exception as e:
+        print(f"Maskeli alan için özellik hesaplama hatası: {e}")
+        return None, None, None, None, None, None
+
+def process_polygon(dem, transform, polygon):
+    try:
+        print(f"Poligon işleniyor: {polygon.Index}")
+        mask = geometry_mask([polygon.geometry], transform=transform, invert=True, out_shape=dem.shape)
+        masked_dem = np.where(mask, dem, np.nan)
+        slope, aspect = calculate_slope_aspect(dem, transform)
+
+        if slope is None or aspect is None:
+            print(f"Poligon {polygon.Index} için Eğim ve Bakı hesaplaması hatalı, atlanıyor.")
+            return None
+
+        masked_slope = np.where(mask, slope, np.nan)
+        masked_aspect = np.where(mask, aspect, np.nan)
+
+        avg_slope_deg, slope_percent, max_slope_percent, min_height, max_height, dominant_aspect = calculate_stats(
+            masked_slope, masked_aspect, masked_dem)
+
+        if avg_slope_deg is None:
+            print(f"Poligon {polygon.Index} için özellik hesaplaması hatalı, atlanıyor.")
+            return None
+
+        result = {
+            "Polygon_ID": polygon.Index,
+            "Ortalama Eğim (Derece)": avg_slope_deg,
+            "Yüzde Eğim": np.nanmean(slope_percent),
+            "Maksimum Eğim (%)": max_slope_percent,
+            "Bakı (Derece)": dominant_aspect,
+            "Bakı Yönü": determine_aspect_direction(dominant_aspect),
+            "Minimum Yükseklik": min_height,
+            "Maksimum Yükseklik": max_height
+        }
+
+        print(f"Poligon {polygon.Index} için hesaplanan değerler:")
+        print(f"Ortalama Eğim (Derece): {avg_slope_deg:.2f}")
+        print(f"Yüzde Eğim: {np.nanmean(slope_percent):.2f}")
+        print(f"Maksimum Eğim (%): {max_slope_percent:.2f}")
+        print(f"Bakı (Derece): {dominant_aspect:.2f}")
+        print(f"Bakı Yönü: {determine_aspect_direction(dominant_aspect)}")
+        print(f"Minimum Yükseklik: {min_height:.2f}")
+        print(f"Maksimum Yükseklik: {max_height:.2f}")
+        
+        return result
+    except Exception as e:
+        print(f"Poligon işleme hatası: {e}")
+        return None
+
+def determine_aspect_direction(aspect_degree):
+    try:
+        if 0 <= aspect_degree < 22.5 or 337.5 <= aspect_degree <= 360:
+            return f"Kuzey yönüne {aspect_degree:.2f} derece"
+        elif 22.5 <= aspect_degree < 67.5:
+            return f"Kuzeydoğu yönüne {aspect_degree:.2f} derece"
+        elif 67.5 <= aspect_degree < 112.5:
+            return f"Doğu yönüne {aspect_degree:.2f} derece"
+        elif 112.5 <= aspect_degree < 157.5:
+            return f"Güneydoğu yönüne {aspect_degree:.2f} derece"
+        elif 157.5 <= aspect_degree < 202.5:
+            return f"Güney yönüne {aspect_degree:.2f} derece"
+        elif 202.5 <= aspect_degree < 247.5:
+            return f"Güneybatı yönüne {aspect_degree:.2f} derece"
+        elif 247.5 <= aspect_degree < 292.5:
+            return f"Batı yönüne {aspect_degree:.2f} derece"
+        elif 292.5 <= aspect_degree < 337.5:
+            return f"Kuzeybatı yönüne {aspect_degree:.2f} derece"
+        else:
+            return "Bilinmeyen"
+    except Exception as e:
+        print(f"Bakı yönü belirleme hatası: {e}")
+        return "Bilinmeyen"
+
+def parallel_process(dem_file, polygons):
+    with rasterio.open(dem_file) as src:
+        dem = src.read(1)
+        transform = src.transform
+        results = Parallel(n_jobs=8)(delayed(process_polygon)(dem, transform, poly) for poly in polygons.itertuples(index=True))
+        print(f"Paralel işleme tamamlandı, {len(results)} sonuç döndürüldü.")
+    return [res for res in results if res is not None]
+
+def get_user_input_with_timeout(prompt, timeout=5):
+    """5 saniye içinde kullanıcıdan 'E' veya 'H' girişi al."""
+    print(prompt, end=" ", flush=True)
+    start_time = time.time()
+    user_input = ''
+    while time.time() - start_time < timeout:
+        if user_input != '':
+            break
+        time.sleep(0.1)
+    if user_input == '':
+        user_input = 'H' 
+    return user_input.strip().upper()
+
+if __name__ == "__main__":
+    try:
+        folder_path = r'your_folder_path\*.xlsx'
+        dem_file = r"your_tif_file.tif"
+        combined_excel_file = r'combined-file_path.xlsx'
+
+        for file_excel in glob.glob(folder_path):
+            print(f"İşleniyor: {file_excel}")
+            df_file = pd.read_excel(file_excel)
+            df_file["parsel_koor"] = df_file["url"].str.split("/?pol=").str[-1]
+            df_file["geometry"] = df_file["parsel_koor"].apply(wkt.loads)
+            polygons_gdf = gpd.GeoDataFrame(df_file, geometry="geometry")
+            
+            user_choice = get_user_input_with_timeout("Paralel işlem yapmak istiyor musunuz? (E/H): ", timeout=5)
+            if user_choice == 'E':
+                print("Paralel işlem başlatılıyor...")
+                results = parallel_process(dem_file, polygons_gdf)
+                print("Paralel işlem tamamlandı.")
+            else:
+                print("Normal işlem başlatılıyor...")
+                results = [process_polygon(rasterio.open(dem_file).read(1), rasterio.open(dem_file).transform, poly) for poly in polygons_gdf.itertuples(index=True)]
+            
+            for result in results:
+                if result:
+                    print(f"Sonuç ekleniyor: {result}")
+                    df_file.at[result["Polygon_ID"], "Ortalama Eğim (Derece)"] = result["Ortalama Eğim (Derece)"]
+                    df_file.at[result["Polygon_ID"], "Yüzde Eğim"] = result["Yüzde Eğim"]
+                    df_file.at[result["Polygon_ID"], "Maksimum Eğim (%)"] = result["Maksimum Eğim (%)"]
+                    df_file.at[result["Polygon_ID"], "Bakı (Derece)"] = result["Bakı (Derece)"]
+                    df_file.at[result["Polygon_ID"], "Bakı Yönü"] = result["Bakı Yönü"]
+                    df_file.at[result["Polygon_ID"], "Minimum Yükseklik"] = result["Minimum Yükseklik"]
+                    df_file.at[result["Polygon_ID"], "Maksimum Yükseklik"] = result["Maksimum Yükseklik"]
+            
+            print(f"Dosya kaydediliyor: {file_excel}")
+            df_file.to_excel(file_excel, index=False)
+            print(f"{file_excel} işlendi ve kaydedildi.")
+
+        print("Tüm dosyalar birleştiriliyor...")
+        df_all = pd.DataFrame()
+        for file_excel in glob.glob(folder_path):
+            df_file = pd.read_excel(file_excel)
+            df_all = pd.concat([df_all, df_file], ignore_index=True)
+
+        df_all.to_excel(combined_excel_file, index=False)
+        print("İşlem tamamlandı ve tüm dosyalar birleştirildi.")
+
+    except Exception as e:
+        print(f"Genel işleme hatası: {e}")
